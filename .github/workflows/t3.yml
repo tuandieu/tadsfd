@@ -9,15 +9,17 @@ permissions:
   contents: read
   actions: read
 
-# Tránh chồng run cùng workflow; mỗi file .yml có group riêng
+# Sửa TAG khác nhau giữa các file để tách biệt hoàn toàn artifacts
+env:
+  TAG: "vps1"   # <-- ĐỔI mỗi file: vps1, vps2, vps3...
+  NODE_IDS: "36124106 36064752 35983870 36011688"
+  # Chỉ áp cho nexus-cli; nexus-network sẽ bỏ qua
+  NEX_FLAGS: "--headless --max-difficulty small_medium"
+
+# Tránh chồng run trong CHÍNH workflow file này
 concurrency:
   group: ${{ github.workflow }}-singleton
   cancel-in-progress: false
-
-env:
-  NODE_IDS: "36124106 36011688 35983870 36064752"
-  # Chỉ áp cho nexus-cli; nexus-network sẽ bỏ qua
-  NEX_FLAGS: "--headless --max-difficulty small_medium"
 
 jobs:
   nexus:
@@ -28,12 +30,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) Tải state cũ (nếu có)
+      # 1) Tải state cũ (nếu có) của CHÍNH workflow + TAG này
       - name: Download previous state artifact
         uses: dawidd6/action-download-artifact@v6
         with:
-          # Nếu bạn đổi tên file workflow, KHÔNG cần sửa dòng này – mình bỏ qua tham số workflow để tránh lệch tên
-          name: nexus-state
+          workflow: ${{ github.workflow }}                 # chỉ lấy trong file workflow này
+          name: nexus-state-${{ env.TAG }}                 # artifact riêng theo TAG
           path: /tmp/nexus-state
           if_no_artifact_found: ignore
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -82,10 +84,8 @@ jobs:
           NODE_ID="${1:?node id required}"
           LOG_DIR="/opt/state/logs"
           mkdir -p "$LOG_DIR"
-
           export PATH="$HOME/.nexus/bin:$PATH"
 
-          # Detect binary
           BIN=""
           if command -v nexus-network >/dev/null 2>&1; then
             BIN="nexus-network"
@@ -94,9 +94,7 @@ jobs:
           else
             echo "No nexus binary found in PATH"; exit 1
           fi
-
-          echo "Using binary: $BIN"
-          $BIN --version || true
+          echo "Using binary: $BIN"; $BIN --version || true
 
           while true; do
             echo "[$(date -Is)] starting node ${NODE_ID}"
@@ -112,14 +110,14 @@ jobs:
           chmod +x /opt/state/start-nexus.sh
           head -n 20 /opt/state/start-nexus.sh
 
-      # 4) Khởi chạy 4 node trong 4 phiên tmux
-      - name: Start 4 Nexus nodes in tmux
+      # 4) Khởi chạy các node trong tmux
+      - name: Start Nexus nodes in tmux
         shell: bash
         run: |
           set -euxo pipefail
           for ID in $NODE_IDS; do
-            tmux has-session -t "node${ID}" 2>/dev/null && tmux kill-session -t "node${ID}" || true
-            tmux new-session -d -s "node${ID}" "/opt/state/start-nexus.sh ${ID}"
+            tmux has-session -t "${{ env.TAG }}-node${ID}" 2>/dev/null && tmux kill-session -t "${{ env.TAG }}-node${ID}" || true
+            tmux new-session -d -s "${{ env.TAG }}-node${ID}" "/opt/state/start-nexus.sh ${ID}"
           done
           tmux ls || true
 
@@ -129,9 +127,9 @@ jobs:
         run: |
           set -euxo pipefail
           for ID in $NODE_IDS; do
-            echo "===== node $ID (tmux) ====="
-            tmux capture-pane -p -S -100 -t "node${ID}" | tail -n 20 || true
-            echo "===== node $ID (file) ====="
+            echo "===== ${{ env.TAG }} node $ID (tmux) ====="
+            tmux capture-pane -p -S -100 -t "${{ env.TAG }}-node${ID}" | tail -n 20 || true
+            echo "===== ${{ env.TAG }} node $ID (file) ====="
             test -f "/opt/state/logs/node${ID}.log" && tail -n 20 "/opt/state/logs/node${ID}.log" || true
           done
 
@@ -172,7 +170,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nexus-state
+          name: nexus-state-${{ env.TAG }}      # artifact tách biệt theo TAG
           path: /tmp/state-bundle/*
           if-no-files-found: ignore
           retention-days: 14

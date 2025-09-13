@@ -1,0 +1,142 @@
+name: Nexus CLI (2 nodes, persist state)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */5 * * *"   # chạy mỗi 5 giờ để kịp backup trước mốc 6h
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # 👉 Dán 2 NODE ID của bạn (cách nhau bằng khoảng trắng)
+  NODE_IDS: "36052788 36063227"
+
+jobs:
+  nexus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # < 6h để còn thời gian upload state
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 1) Tải state cũ (nếu có) từ artifact
+      - name: Download previous state artifact
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: main.yml            # ⚠️ đổi lại cho khớp TÊN FILE workflow thật
+          name: nexus-state
+          path: /tmp/nexus-state
+          if_no_artifact_found: ignore
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore state (if present)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /opt/state
+          sudo chown -R "$USER:$USER" /opt/state
+          # Khôi phục ~/.nexus
+          if [ -f /tmp/nexus-state/home-runner-nexus.tar.gz ]; then
+            tar -xzf /tmp/nexus-state/home-runner-nexus.tar.gz -C "$HOME"
+          fi
+          # Khôi phục /opt/state
+          if [ -f /tmp/nexus-state/opt-state.tar.gz ]; then
+            sudo tar -xzf /tmp/nexus-state/opt-state.tar.gz -C /
+            sudo chown -R "$USER:$USER" /opt/state
+          fi
+          mkdir -p /opt/state/logs
+
+      - name: Prepare system
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y tmux curl
+
+      # 2) Cài Nexus CLI
+      - name: Install Nexus CLI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl https://cli.nexus.xyz/ | sh
+          echo "$HOME/.nexus/bin" >> "$GITHUB_PATH"
+
+      - name: Verify nexus-network path
+        id: which
+        shell: bash
+        run: |
+          set -euxo pipefail
+          command -v nexus-network && nexus-network --version || true
+          echo "fallback=" >> $GITHUB_OUTPUT
+
+      # 3) Script chạy node
+      - name: Ensure start script exists
+        shell: bash
+        run: |
+          set -euxo pipefail
+          install -d -m 755 /opt/state /opt/state/logs
+          cat <<'SCRIPT' | sed 's/^[[:space:]]*//' > /opt/state/start-nexus.sh
+            #!/usr/bin/env bash
+            set -euo pipefail
+            NODE_ID="$1"
+            LOG_DIR="/opt/state/logs"
+            mkdir -p "$LOG_DIR"
+            export PATH="$HOME/.nexus/bin:$PATH"
+            command -v nexus-network && nexus-network --version || true
+            while true; do
+              echo "[$(date -Is)] starting node ${NODE_ID}"
+              nexus-network start --node-id "${NODE_ID}" 2>&1 | tee -a "${LOG_DIR}/node${NODE_ID}.log"
+              echo "[$(date -Is)] node ${NODE_ID} exited, restart in 15s..."
+              sleep 15
+            done
+          SCRIPT
+          chmod +x /opt/state/start-nexus.sh
+          head -n 20 /opt/state/start-nexus.sh
+
+      # 4) Khởi chạy **2** node trong 2 phiên tmux
+      - name: Start 2 Nexus nodes in tmux
+        shell: bash
+        run: |
+          set -euxo pipefail
+          for ID in $NODE_IDS; do
+            tmux has-session -t "node${ID}" 2>/dev/null && tmux kill-session -t "node${ID}" || true
+          done
+          for ID in $NODE_IDS; do
+            tmux new-session -d -s "node${ID}" "/opt/state/start-nexus.sh ${ID}"
+          done
+          tmux ls || true
+
+      # 5) SSH debug khi chạy tay (bật terminal tmate)
+      - name: Open tmate (manual only)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: false  # đặt true nếu bạn đã add SSH key vào GitHub profile
+
+      # 6) Chạy ~5h50' rồi backup
+      - name: Let it run
+        shell: bash
+        run: |
+          sleep $((5*60*60 + 50*60))
+
+      # 7) Đóng gói state
+      - name: Create state archives
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/state-bundle
+          tar -czf /tmp/state-bundle/home-runner-nexus.tar.gz -C "$HOME" .nexus || true
+          sudo tar -czf /tmp/state-bundle/opt-state.tar.gz -C / opt/state
+          sudo chown "$USER:$USER" /tmp/state-bundle/*.tar.gz
+
+      - name: Upload state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-state
+          path: /tmp/state-bundle
+          retention-days: 14

@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: false           # run mới sẽ đợi, không hủy run cũ (để kịp backup)
 
 env:
-  NODE_IDS: "36245093 36273667 36245094 36166431"
+  NODE_IDS: "36585197 36435419 36414917 36435415"
   LOG_MAX_MB: "50"                    # giới hạn log trong snapshot (MB)
 
 jobs:

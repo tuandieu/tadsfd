@@ -143,7 +143,6 @@ jobs:
           az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts \
           "systeminfo | findstr /i Hyper-V" -o table || true
 
-      # ---- FIXED HEREDOC STEP ----
       - name: Generate .rdp file
         id: rdp
         shell: bash
@@ -152,18 +151,15 @@ jobs:
           IP="${{ steps.createvm.outputs.publicIp }}"
           USER="${{ secrets.ADMIN_USERNAME }}"
           mkdir -p out
-          # Cách 1: heredoc quoted + thay biến bằng sed (an toàn với YAML)
-          cat > "out/${VM}.rdp" <<'EOF'
-screen mode id:i:2
-session bpp:i:32
-prompt for credentials:i:1
-authentication level:i:2
-negotiate security layer:i:1
-full address:s:${IP}
-username:s:${USER}
-EOF
-          sed -i "s|\${IP}|${IP}|g" "out/${VM}.rdp"
-          sed -i "s|\${USER}|${USER}|g" "out/${VM}.rdp"
+          printf '%s\n' \
+            'screen mode id:i:2' \
+            'session bpp:i:32' \
+            'prompt for credentials:i:1' \
+            'authentication level:i:2' \
+            'negotiate security layer:i:1' \
+            "full address:s:${IP}" \
+            "username:s:${USER}" \
+            > "out/${VM}.rdp"
           echo "rdp_path=out/${VM}.rdp" >> "$GITHUB_OUTPUT"
 
       - name: Upload RDP artifact

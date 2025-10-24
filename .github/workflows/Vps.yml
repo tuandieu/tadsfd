@@ -1,0 +1,185 @@
+name: Azure Windows VM with Hyper-V (Create/Destroy)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Chọn hành động: create hoặc destroy"
+        required: true
+        default: "create"
+      resourceGroup:
+        description: "Azure Resource Group"
+        required: true
+        default: "rg-win-hyperv"
+      location:
+        description: "Azure region"
+        required: true
+        default: "eastasia"
+      vmName:
+        description: "VM name"
+        required: true
+        default: "win-hyperv-01"
+      vmSize:
+        description: "Size hỗ trợ nested virtualization (Dv3/v4/v5 hoặc Ev3/v4/v5)"
+        required: true
+        default: "Standard_D4s_v5"
+      publicIPSku:
+        description: "Public IP SKU"
+        required: true
+        default: "Standard"
+      osDiskSizeGB:
+        description: "OS disk size (GB)"
+        required: true
+        default: "127"
+      lockRdpToIp:
+        description: "Chỉ cho phép IP này RDP (đặt * để mở toàn cầu)"
+        required: true
+        default: "*"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RG: ${{ github.event.inputs.resourceGroup }}
+  LOC: ${{ github.event.inputs.location }}
+  VM: ${{ github.event.inputs.vmName }}
+  SIZE: ${{ github.event.inputs.vmSize }}
+  PIPSKU: ${{ github.event.inputs.publicIPSku }}
+  OSDISK: ${{ github.event.inputs.osDiskSizeGB }}
+  SRCIP: ${{ github.event.inputs.lockRdpToIp }}
+
+jobs:
+  create:
+    if: ${{ github.event.inputs.action == 'create' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set subscription
+        run: |
+          az account set --subscription "${{ secrets.AZ_SUBSCRIPTION_ID }}"
+          az account show -o table
+
+      - name: Create Resource Group
+        run: |
+          az group create --name "$RG" --location "$LOC" -o table
+
+      - name: Create Windows Server 2022 VM
+        id: createvm
+        run: |
+          IMAGE="MicrosoftWindowsServer:WindowsServer:2022-datacenter-azure-edition-smalldisk:latest"
+          az vm create \
+            --resource-group "$RG" \
+            --name "$VM" \
+            --image "$IMAGE" \
+            --size "$SIZE" \
+            --admin-username "${{ secrets.ADMIN_USERNAME }}" \
+            --admin-password "${{ secrets.ADMIN_PASSWORD }}" \
+            --public-ip-sku "$PIPSKU" \
+            --os-disk-size-gb "$OSDISK" \
+            --storage-sku StandardSSD_LRS \
+            --authentication-type password \
+            --nsg "" \
+            -o json > vm.json
+
+          echo "publicIp=$(jq -r '.publicIpAddress' vm.json)" >> $GITHUB_OUTPUT
+
+      - name: Create NSG + allow RDP 3389
+        run: |
+          az network nsg create -g "$RG" -n "${VM}-nsg" -l "$LOC" -o none
+          az network nsg rule create -g "$RG" --nsg-name "${VM}-nsg" \
+            -n allow-rdp-3389 --priority 1000 \
+            --access Allow --direction Inbound --protocol Tcp \
+            --destination-port-ranges 3389 \
+            --source-address-prefixes "$SRCIP" -o none
+
+          NIC_ID=$(az vm show -g "$RG" -n "$VM" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
+          NIC_NAME=$(basename "$NIC_ID")
+          az network nic update -g "$RG" -n "$NIC_NAME" --network-security-group "${VM}-nsg" -o none
+
+      - name: Ensure RDP enabled inside Windows
+        run: |
+          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts \
+          "Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'" \
+          -o table || true
+
+      - name: Install Hyper-V role
+        run: |
+          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts \
+          "Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All -NoRestart" \
+          -o table || true
+
+      - name: Reboot to finish Hyper-V
+        run: |
+          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts "Restart-Computer -Force" -o table || true
+          echo "Sleeping 90s to wait VM boot..."
+          sleep 90
+
+      - name: Verify Hyper-V (best-effort)
+        continue-on-error: true
+        run: |
+          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts \
+          "Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V | Format-List" -o table || true
+          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts \
+          "systeminfo | findstr /i Hyper-V" -o table || true
+
+      - name: Generate .rdp file
+        id: rdp
+        run: |
+          IP="${{ steps.createvm.outputs.publicIp }}"
+          USER="${{ secrets.ADMIN_USERNAME }}"
+          mkdir -p out
+          cat > out/${VM}.rdp <<EOF
+screen mode id:i:2
+session bpp:i:32
+prompt for credentials:i:1
+authentication level:i:2
+negotiate security layer:i:1
+full address:s:${IP}
+username:s:${USER}
+EOF
+          echo "rdp_path=out/${VM}.rdp" >> $GITHUB_OUTPUT
+
+      - name: Upload RDP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-file
+          path: ${{ steps.rdp.outputs.rdp_path }}
+
+      - name: Output connection info
+        run: |
+          echo "=== VM PUBLIC IP ==="
+          echo "${{ steps.createvm.outputs.publicIp }}"
+          echo "=== RDP ==="
+          echo "Username: ${{ secrets.ADMIN_USERNAME }}"
+          echo "Password: (trong Secrets: ADMIN_PASSWORD)"
+          echo "Tải artifact 'rdp-file' để mở bằng Remote Desktop."
+
+  destroy:
+    if: ${{ github.event.inputs.action == 'destroy' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set subscription
+        run: |
+          az account set --subscription "${{ secrets.AZ_SUBSCRIPTION_ID }}"
+          az account show -o table
+
+      - name: Delete resource group
+        run: |
+          az group delete --name "$RG" --yes --no-wait
+          echo "Đã gửi lệnh xóa Resource Group $RG."
+          

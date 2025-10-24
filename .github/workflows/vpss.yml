@@ -1,4 +1,4 @@
-name: Azure Windows VM with Hyper-V (Create/Destroy)
+name: Azure Ubuntu (Containers) - Create/Destroy
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       resourceGroup:
         description: "Resource Group"
         required: true
-        default: "rg-win-hyperv"
+        default: "rg-ubuntu-containers"
       location:
         description: "Region"
         required: true
@@ -18,21 +18,17 @@ on:
       vmName:
         description: "VM name"
         required: true
-        default: "win-hyperv-01"
+        default: "ubnt-b1s-01"
       vmSize:
-        description: "Size hỗ trợ nested virt (Dv3/v4/v5 hoặc Ev3/v4/v5)"
+        description: "VM size (B1s ~ free/very cheap)"
         required: true
-        default: "Standard_D4s_v5"
+        default: "Standard_B1s"
       publicIPSku:
         description: "Public IP SKU"
         required: true
         default: "Standard"
-      osDiskSizeGB:
-        description: "OS disk size (GB)"
-        required: true
-        default: "127"
-      lockRdpToIp:
-        description: "IP được phép RDP (đặt * để mở toàn cầu)"
+      lockSshToIp:
+        description: "IP được phép SSH (đặt * để mở toàn cầu)"
         required: true
         default: "*"
 
@@ -46,22 +42,31 @@ env:
   VM: ${{ github.event.inputs.vmName }}
   SIZE: ${{ github.event.inputs.vmSize }}
   PIPSKU: ${{ github.event.inputs.publicIPSku }}
-  OSDISK: ${{ github.event.inputs.osDiskSizeGB }}
-  SRCIP: ${{ github.event.inputs.lockRdpToIp }}
+  SRCIP: ${{ github.event.inputs.lockSshToIp }}
 
 jobs:
   create:
     if: ${{ github.event.inputs.action == 'create' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Azure Login
+      # ---- Login: dùng AZURE_CREDENTIALS nếu có, ngược lại dùng OIDC ----
+      - name: Azure Login (Service Principal JSON)
+        if: ${{ secrets.AZURE_CREDENTIALS != '' }}
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Azure Login (OIDC)
+        if: ${{ secrets.AZURE_CREDENTIALS == '' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZ_SUBSCRIPTION_ID }}
 
       - name: Set subscription
         shell: bash
@@ -76,12 +81,12 @@ jobs:
           set -euo pipefail
           az group create --name "$RG" --location "$LOC" -o table
 
-      - name: Create Windows Server 2022 VM
+      - name: Create Ubuntu 22.04 VM (B1s)
         id: createvm
         shell: bash
         run: |
           set -euo pipefail
-          IMAGE="MicrosoftWindowsServer:WindowsServer:2022-datacenter-azure-edition-smalldisk:latest"
+          IMAGE="Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest"
           az vm create \
             --resource-group "$RG" \
             --name "$VM" \
@@ -89,104 +94,115 @@ jobs:
             --size "$SIZE" \
             --admin-username "${{ secrets.ADMIN_USERNAME }}" \
             --admin-password "${{ secrets.ADMIN_PASSWORD }}" \
-            --public-ip-sku "$PIPSKU" \
-            --os-disk-size-gb "$OSDISK" \
-            --storage-sku StandardSSD_LRS \
             --authentication-type password \
+            --public-ip-sku "$PIPSKU" \
+            --os-disk-size-gb 30 \
             --nsg "" \
             -o json > vm.json
+
           echo "publicIp=$(jq -r '.publicIpAddress' vm.json)" >> "$GITHUB_OUTPUT"
 
-      - name: Create NSG + allow RDP 3389
+      - name: Create NSG + allow SSH:22 and HTTP:8080 (for demo)
         shell: bash
         run: |
           set -euo pipefail
           az network nsg create -g "$RG" -n "${VM}-nsg" -l "$LOC" -o none
+
+          # SSH
           az network nsg rule create -g "$RG" --nsg-name "${VM}-nsg" \
-            -n allow-rdp-3389 --priority 1000 \
+            -n allow-ssh-22 --priority 1000 \
             --access Allow --direction Inbound --protocol Tcp \
-            --destination-port-ranges 3389 \
+            --destination-port-ranges 22 \
             --source-address-prefixes "$SRCIP" -o none
+
+          # HTTP demo (Nginx trong container map 8080)
+          az network nsg rule create -g "$RG" --nsg-name "${VM}-nsg" \
+            -n allow-http-8080 --priority 1010 \
+            --access Allow --direction Inbound --protocol Tcp \
+            --destination-port-ranges 8080 \
+            --source-address-prefixes "$SRCIP" -o none
+
           NIC_ID=$(az vm show -g "$RG" -n "$VM" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
           NIC_NAME=$(basename "$NIC_ID")
           az network nic update -g "$RG" -n "$NIC_NAME" --network-security-group "${VM}-nsg" -o none
 
-      - name: Ensure RDP enabled inside Windows
+      - name: Prepare setup script (Docker + LXD + demo containers)
         shell: bash
         run: |
           set -euo pipefail
-          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts \
-          "Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'" \
-          -o table || true
+          ADMIN_USER="${{ secrets.ADMIN_USERNAME }}"
 
-      - name: Install Hyper-V role
+          mkdir -p ci
+          # ghi script bằng printf để tránh lỗi YAML/heredoc
+          printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' \
+            'export DEBIAN_FRONTEND=noninteractive' \
+            'apt-get update -y' \
+            'apt-get install -y docker.io snapd' \
+            'systemctl enable --now docker' \
+            "usermod -aG docker ${ADMIN_USER}" \
+            'snap install core || true' \
+            'snap install lxd --channel=5.21/stable' \
+            'export PATH=$PATH:/snap/bin' \
+            'lxd waitready' \
+            'lxd init --auto' \
+            "usermod -aG lxd ${ADMIN_USER}" \
+            '# demo docker container: nginx on 8080' \
+            'docker rm -f webdemo || true' \
+            'docker run -d --name webdemo --restart unless-stopped -p 8080:80 nginx:stable' \
+            '# demo lxd container: Ubuntu 22.04' \
+            'if ! lxc info u1 >/dev/null 2>&1; then lxc launch images:ubuntu/22.04 u1; fi' \
+            'sleep 5' \
+            "lxc exec u1 -- bash -lc 'apt-get update -y && apt-get install -y nginx && systemctl enable --now nginx || true'" \
+            > ci/setup.sh
+
+          chmod +x ci/setup.sh
+
+      - name: Run setup script inside VM
         shell: bash
         run: |
           set -euo pipefail
-          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts \
-          "Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All -NoRestart" \
-          -o table || true
+          az vm run-command invoke \
+            -g "$RG" -n "$VM" \
+            --command-id RunShellScript \
+            --scripts @ci/setup.sh \
+            -o table
 
-      - name: Reboot to finish Hyper-V
+      - name: Output SSH + test URLs
         shell: bash
         run: |
-          set -euo pipefail
-          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts "Restart-Computer -Force" -o table || true
-          sleep 90
-
-      - name: Verify Hyper-V (best-effort)
-        shell: bash
-        continue-on-error: true
-        run: |
-          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts \
-          "Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V | Format-List" -o table || true
-          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts \
-          "systeminfo | findstr /i Hyper-V" -o table || true
-
-      - name: Generate .rdp file
-        id: rdp
-        shell: bash
-        run: |
-          set -euo pipefail
           IP="${{ steps.createvm.outputs.publicIp }}"
-          USER="${{ secrets.ADMIN_USERNAME }}"
-          mkdir -p out
-          printf '%s\n' \
-            'screen mode id:i:2' \
-            'session bpp:i:32' \
-            'prompt for credentials:i:1' \
-            'authentication level:i:2' \
-            'negotiate security layer:i:1' \
-            "full address:s:${IP}" \
-            "username:s:${USER}" \
-            > "out/${VM}.rdp"
-          echo "rdp_path=out/${VM}.rdp" >> "$GITHUB_OUTPUT"
+          echo "=== SSH ==="
+          echo "ssh ${ADMIN_USER:-${{ secrets.ADMIN_USERNAME }}}@${IP}"
+          echo
+          echo "=== HTTP demo (Docker Nginx) ==="
+          echo "http://${IP}:8080/"
+          printf '%s\n' "ssh ${{ secrets.ADMIN_USERNAME }}@${IP}" "http://${IP}:8080/" > out.txt
 
-      - name: Upload RDP artifact
+      - name: Upload connection info
         uses: actions/upload-artifact@v4
         with:
-          name: rdp-file
-          path: ${{ steps.rdp.outputs.rdp_path }}
-
-      - name: Output connection info
-        shell: bash
-        run: |
-          echo "=== VM PUBLIC IP ==="
-          echo "${{ steps.createvm.outputs.publicIp }}"
-          echo "=== RDP ==="
-          echo "Username: ${{ secrets.ADMIN_USERNAME }}"
-          echo "Password: (trong Secrets: ADMIN_PASSWORD)"
-          echo "Tải artifact 'rdp-file' để mở bằng Remote Desktop."
+          name: connection-info
+          path: out.txt
 
   destroy:
     if: ${{ github.event.inputs.action == 'destroy' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
-      - name: Azure Login
+      # Login 2 chế độ như trên
+      - name: Azure Login (Service Principal JSON)
+        if: ${{ secrets.AZURE_CREDENTIALS != '' }}
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Azure Login (OIDC)
+        if: ${{ secrets.AZURE_CREDENTIALS == '' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZ_SUBSCRIPTION_ID }}
 
       - name: Set subscription
         shell: bash
@@ -199,5 +215,5 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          az group delete --name "$RG" --yes --no-wait
-          echo "Đã gửi lệnh xóa Resource Group $RG."
+          az group delete --name "${{ github.event.inputs.resourceGroup }}" --yes --no-wait
+          echo "Đã gửi lệnh xóa ${RG}"

@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: "Chọn hành động: create hoặc destroy"
+        description: "create hoặc destroy"
         required: true
         default: "create"
       resourceGroup:
-        description: "Azure Resource Group"
+        description: "Resource Group"
         required: true
         default: "rg-win-hyperv"
       location:
-        description: "Azure region"
+        description: "Region"
         required: true
         default: "eastasia"
       vmName:
@@ -20,7 +20,7 @@ on:
         required: true
         default: "win-hyperv-01"
       vmSize:
-        description: "Size hỗ trợ nested virtualization (Dv3/v4/v5 hoặc Ev3/v4/v5)"
+        description: "Size hỗ trợ nested virt (Dv3/v4/v5 hoặc Ev3/v4/v5)"
         required: true
         default: "Standard_D4s_v5"
       publicIPSku:
@@ -32,7 +32,7 @@ on:
         required: true
         default: "127"
       lockRdpToIp:
-        description: "Chỉ cho phép IP này RDP (đặt * để mở toàn cầu)"
+        description: "IP được phép RDP (đặt * để mở toàn cầu)"
         required: true
         default: "*"
 
@@ -64,17 +64,23 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Set subscription
+        shell: bash
         run: |
+          set -euo pipefail
           az account set --subscription "${{ secrets.AZ_SUBSCRIPTION_ID }}"
           az account show -o table
 
       - name: Create Resource Group
+        shell: bash
         run: |
+          set -euo pipefail
           az group create --name "$RG" --location "$LOC" -o table
 
       - name: Create Windows Server 2022 VM
         id: createvm
+        shell: bash
         run: |
+          set -euo pipefail
           IMAGE="MicrosoftWindowsServer:WindowsServer:2022-datacenter-azure-edition-smalldisk:latest"
           az vm create \
             --resource-group "$RG" \
@@ -89,41 +95,47 @@ jobs:
             --authentication-type password \
             --nsg "" \
             -o json > vm.json
-
-          echo "publicIp=$(jq -r '.publicIpAddress' vm.json)" >> $GITHUB_OUTPUT
+          echo "publicIp=$(jq -r '.publicIpAddress' vm.json)" >> "$GITHUB_OUTPUT"
 
       - name: Create NSG + allow RDP 3389
+        shell: bash
         run: |
+          set -euo pipefail
           az network nsg create -g "$RG" -n "${VM}-nsg" -l "$LOC" -o none
           az network nsg rule create -g "$RG" --nsg-name "${VM}-nsg" \
             -n allow-rdp-3389 --priority 1000 \
             --access Allow --direction Inbound --protocol Tcp \
             --destination-port-ranges 3389 \
             --source-address-prefixes "$SRCIP" -o none
-
           NIC_ID=$(az vm show -g "$RG" -n "$VM" --query 'networkProfile.networkInterfaces[0].id' -o tsv)
           NIC_NAME=$(basename "$NIC_ID")
           az network nic update -g "$RG" -n "$NIC_NAME" --network-security-group "${VM}-nsg" -o none
 
       - name: Ensure RDP enabled inside Windows
+        shell: bash
         run: |
+          set -euo pipefail
           az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts \
           "Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'" \
           -o table || true
 
       - name: Install Hyper-V role
+        shell: bash
         run: |
+          set -euo pipefail
           az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts \
           "Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All -NoRestart" \
           -o table || true
 
       - name: Reboot to finish Hyper-V
+        shell: bash
         run: |
+          set -euo pipefail
           az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts "Restart-Computer -Force" -o table || true
-          echo "Sleeping 90s to wait VM boot..."
           sleep 90
 
       - name: Verify Hyper-V (best-effort)
+        shell: bash
         continue-on-error: true
         run: |
           az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts \
@@ -131,13 +143,17 @@ jobs:
           az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts \
           "systeminfo | findstr /i Hyper-V" -o table || true
 
+      # ---- FIXED HEREDOC STEP ----
       - name: Generate .rdp file
         id: rdp
+        shell: bash
         run: |
+          set -euo pipefail
           IP="${{ steps.createvm.outputs.publicIp }}"
           USER="${{ secrets.ADMIN_USERNAME }}"
           mkdir -p out
-          cat > out/${VM}.rdp <<EOF
+          # Cách 1: heredoc quoted + thay biến bằng sed (an toàn với YAML)
+          cat > "out/${VM}.rdp" <<'EOF'
 screen mode id:i:2
 session bpp:i:32
 prompt for credentials:i:1
@@ -146,7 +162,9 @@ negotiate security layer:i:1
 full address:s:${IP}
 username:s:${USER}
 EOF
-          echo "rdp_path=out/${VM}.rdp" >> $GITHUB_OUTPUT
+          sed -i "s|\${IP}|${IP}|g" "out/${VM}.rdp"
+          sed -i "s|\${USER}|${USER}|g" "out/${VM}.rdp"
+          echo "rdp_path=out/${VM}.rdp" >> "$GITHUB_OUTPUT"
 
       - name: Upload RDP artifact
         uses: actions/upload-artifact@v4
@@ -155,6 +173,7 @@ EOF
           path: ${{ steps.rdp.outputs.rdp_path }}
 
       - name: Output connection info
+        shell: bash
         run: |
           echo "=== VM PUBLIC IP ==="
           echo "${{ steps.createvm.outputs.publicIp }}"
@@ -174,12 +193,15 @@ EOF
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Set subscription
+        shell: bash
         run: |
+          set -euo pipefail
           az account set --subscription "${{ secrets.AZ_SUBSCRIPTION_ID }}"
           az account show -o table
 
       - name: Delete resource group
+        shell: bash
         run: |
+          set -euo pipefail
           az group delete --name "$RG" --yes --no-wait
           echo "Đã gửi lệnh xóa Resource Group $RG."
-          
